@@ -2,22 +2,25 @@ services:
   - type: web
     name: tds-data-analyst-bot
     runtime: python
-    plan: starter          # free tier sleeps; starter stays warm during grading
+    # FREE tier: no card required. Trade-offs vs `starter`:
+    #   * spins down after ~15 min idle (cold start ~50s) -> keep-alive ping
+    #   * 512 MB RAM -> requirements.txt is kept lean
+    #   * no persistent disk -> logs live on the ephemeral filesystem and are
+    #     recreated at boot by ensure_log_files(), so /run.jsonl is never a 404
+    plan: free
     region: singapore
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     autoDeploy: true
-    disk:
-      name: logs
-      mountPath: /opt/render/project/src/logs
-      sizeGB: 1
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.7"
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: LLM_API_KEY
+        sync: false
+      - key: TAVILY_API_KEY
         sync: false
       - key: WEBHOOK_SECRET
         generateValue: true
@@ -27,7 +30,12 @@ services:
         value: gpt-4.1-mini
       - key: USE_WEBHOOK
         value: "true"
+      # Free instances are slower and cold-start; leave headroom inside the
+      # grader's 300s whole-exchange budget.
       - key: TURN_DEADLINE_SECONDS
-        value: "150"
+        value: "120"
+      - key: MAX_TOOL_CALLS
+        value: "18"
+      # Relative path -> resolved against the project root by config.py.
       - key: LOG_DIR
-        value: /opt/render/project/src/logs
+        value: logs
