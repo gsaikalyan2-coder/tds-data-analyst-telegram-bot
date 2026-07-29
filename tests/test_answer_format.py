@@ -101,3 +101,51 @@ def test_reply_is_single_line_no_extras():
     out = build_reply({"state": "Assam"}, "https://h/run.jsonl", t)
     assert "\n" not in out
     assert not out.startswith("`")
+
+
+# --- regression: unquoted placeholders (found in live testing) --------------
+# `{"total": <number>}` needs the relaxer; the relaxer used to substitute a
+# quoted marker into an already-quoted slot, producing ""__PLACEHOLDER__"".
+# Template extraction then failed, the wrapper was applied by default, and the
+# reply came back double-wrapped: {"answer": {"answer": {"total": 234}}}.
+
+SUM_MSG = (
+    'What is the sum of that dataset? Reply with ONLY this JSON object and '
+    'nothing else: {"answer": {"total": <number>}, "log_url": "<public URL>"}'
+)
+
+
+def test_unquoted_number_placeholder_is_extracted():
+    t = extract_response_template(SUM_MSG)
+    assert t is not None, "template must parse despite the bare <number>"
+    assert set(t) == {"answer", "log_url"}
+    assert list(t["answer"].keys()) == ["total"]
+
+
+def test_unquoted_placeholder_reply_is_not_double_wrapped():
+    t = extract_response_template(SUM_MSG)
+    answer = coerce_answer({"answer": {"total": 234}}, t)
+    out = json.loads(build_reply(answer, "https://h/run.jsonl", t))
+    assert out["answer"] == {"total": 234}, "must not nest answer inside answer"
+    assert set(out) == {"answer", "log_url"}
+
+
+def test_mixed_quoted_and_bare_placeholders():
+    msg = 'Reply with ONLY {"answer": {"state": "<name>", "rate": <number>}, "log_url": "<url>"}'
+    t = extract_response_template(msg)
+    assert t is not None
+    assert sorted(t["answer"].keys()) == ["rate", "state"]
+
+
+def test_no_template_lone_answer_key_is_unwrapped():
+    # "hello" -> model returns {"answer": "hello"} -> build_reply wraps again
+    assert coerce_answer({"answer": "hello"}, None) == "hello"
+    out = json.loads(build_reply(coerce_answer({"answer": "hello"}, None),
+                                 "https://h/run.jsonl", None))
+    assert out["answer"] == "hello"
+
+
+def test_list_placeholder_still_works():
+    t = extract_response_template('Reply with ONLY {"values": [<numbers>]}')
+    answer = coerce_answer({"values": [1.5, 2.5]}, t)
+    assert json.loads(build_reply(answer, "https://h/run.jsonl", t)) == {"values": [1.5, 2.5]}

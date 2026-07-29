@@ -68,6 +68,13 @@ def iter_brace_blocks(text: str):
         i = j + 1 if j > i else i + 1
 
 
+# A placeholder may or may not already be inside quotes:
+#     {"state": "<state name>"}   <- quoted; must replace INCLUDING the quotes
+#     {"total": <number>}         <- bare;   must replace and ADD quotes
+# Substituting a quoted replacement into an already-quoted slot yields
+# ""__PLACEHOLDER__"", which is invalid JSON -- so the quoted form is matched
+# first, with its surrounding quotes consumed.
+_QUOTED_PLACEHOLDER = re.compile(r'"\s*<[^<>"]*>\s*"')
 _PLACEHOLDER = re.compile(r'<[^<>{}"]*>')
 
 
@@ -80,7 +87,10 @@ def _relax_to_json(block: str) -> str:
     where a value should be. Replace bare placeholders with null, and quoted
     ones with a marker string.
     """
-    out = _PLACEHOLDER.sub(lambda m: '"__PLACEHOLDER__"', block)
+    # Quoted placeholders first, consuming their own quotes, then bare ones.
+    # Order matters: doing it the other way round produces ""__PLACEHOLDER__"".
+    out = _QUOTED_PLACEHOLDER.sub('"__PLACEHOLDER__"', block)
+    out = _PLACEHOLDER.sub('"__PLACEHOLDER__"', out)
     out = re.sub(r",\s*([}\]])", r"\1", out)          # trailing commas
     out = out.replace("'", '"')                        # single-quoted keys
     return out
@@ -190,6 +200,17 @@ def coerce_answer(raw: Any, template: dict | None) -> Any:
         and isinstance(inner_template, dict)
         and set(raw.keys()) == {ANSWER_KEY}
         and set(inner_template.keys()) != {ANSWER_KEY}
+    ):
+        raw = raw[ANSWER_KEY]
+
+    # Same mistake, but with no template to compare against (the message did
+    # not spell out a shape). A lone "answer" key is far more likely to be the
+    # model echoing the envelope than a genuine answer field, and build_reply
+    # is about to wrap it again -- so unwrap it here.
+    if (
+        inner_template is None
+        and isinstance(raw, dict)
+        and set(raw.keys()) == {ANSWER_KEY}
     ):
         raw = raw[ANSWER_KEY]
 
