@@ -341,8 +341,18 @@ class DataAnalystAgent:
         object.__setattr__(self.s, "model", self.s.fallback_model)
         return True
 
+    # The model occasionally invents a plausible parameter name instead of the
+    # declared one -- "answer", "result", "value". Missing it costs a whole
+    # extra round trip through _force_answer, which near the deadline is the
+    # difference between answering and timing out. So accept the aliases.
+    _ANSWER_KEYS = ("answer_json", "answer", "result", "value", "output")
+
     def _parse_final(self, args: dict, template: dict | None) -> Any:
-        raw = args.get("answer_json")
+        raw = None
+        for key in self._ANSWER_KEYS:
+            if args.get(key) is not None:
+                raw = args[key]
+                break
         if raw is None:
             return None
         if isinstance(raw, (dict, list, int, float, bool)):
@@ -350,7 +360,15 @@ class DataAnalystAgent:
         try:
             return json.loads(raw)
         except (json.JSONDecodeError, TypeError):
-            return self._salvage(str(raw), template)
+            salvaged = self._salvage(str(raw), template)
+            if salvaged is not None:
+                return salvaged
+            # Not JSON and nothing to salvage -- but a bare scalar like
+            # "Assam" or "hello" is a legitimate answer for a scalar-shaped
+            # question. Returning it beats discarding it and paying for a
+            # whole extra _force_answer round trip.
+            text = str(raw).strip()
+            return text or None
 
     def _salvage(self, text: str, template: dict | None) -> Any:
         from .answer_format import enforce_single_json_object
