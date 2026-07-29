@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+logs/runs/
+logs/run.jsonl
+.pytest_cache/
+*.session
