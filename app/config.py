@@ -2,7 +2,9 @@
 same image runs locally, on Render, and on Railway with no code changes."""
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,11 +36,32 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def url_safe_token(raw: str) -> str:
+    """Derive a token that is safe both as a URL path segment and as Telegram's
+    `secret_token` header value.
+
+    Render's `generateValue: true` emits base64, which contains '/', '+' and
+    '='. A '/' inside the secret splits the `/telegram/{secret}` route into two
+    path segments, the route stops matching, and every update comes back 404 --
+    which looks exactly like a dead service. Telegram's secret_token field is
+    also restricted to [A-Za-z0-9_-], so the raw value is invalid there too.
+
+    Strip to the safe alphabet; if too little survives, hash instead. Either way
+    the result is deterministic, so the URL we register and the URL we serve
+    always agree.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "", raw or "")
+    if len(cleaned) >= 12:
+        return cleaned[:128]
+    return hashlib.sha256((raw or "tds-p1").encode()).hexdigest()[:32]
+
+
 @dataclass(frozen=True)
 class Settings:
     # --- Telegram ---
     telegram_bot_token: str
-    webhook_secret: str
+    webhook_secret: str        # raw, as configured
+    webhook_token: str         # URL-safe derivative actually used in the path
     use_webhook: bool
 
     # --- Public hosting ---
@@ -74,9 +97,12 @@ def load_settings() -> Settings:
         elif railway_host:
             base_url = f"https://{railway_host}"
 
+    raw_secret = _env("WEBHOOK_SECRET", "tds-p1-hook")
+
     return Settings(
         telegram_bot_token=_env("TELEGRAM_BOT_TOKEN", required=True),
-        webhook_secret=_env("WEBHOOK_SECRET", "tds-p1-hook"),
+        webhook_secret=raw_secret,
+        webhook_token=url_safe_token(raw_secret),
         use_webhook=_env("USE_WEBHOOK", "true").lower() in {"1", "true", "yes"},
         public_base_url=base_url,
         port=_int_env("PORT", 8000),

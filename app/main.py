@@ -41,12 +41,15 @@ async def lifespan(app: FastAPI):
     await application.start()
 
     if settings.use_webhook and settings.public_base_url:
-        url = f"{settings.public_base_url}/telegram/{settings.webhook_secret}"
+        # webhook_token, not webhook_secret: the raw value may be base64 and
+        # contain '/', which would split the path and 404 every update.
+        url = f"{settings.public_base_url}/telegram/{settings.webhook_token}"
         await application.bot.set_webhook(
             url=url,
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True,
             max_connections=40,
+            secret_token=settings.webhook_token,
         )
         log.info("webhook set: %s", url)
     else:
@@ -71,8 +74,13 @@ app = FastAPI(title="TDS P1 Data-Analyst Telegram Bot", lifespan=lifespan)
 
 @app.post("/telegram/{secret}")
 async def telegram_webhook(secret: str, request: Request) -> Response:
-    if secret != settings.webhook_secret:
+    # Accept the derived token, and the raw secret too, so an already-registered
+    # webhook from a previous deploy keeps working until it re-registers.
+    if secret not in (settings.webhook_token, settings.webhook_secret):
         raise HTTPException(status_code=403, detail="bad secret")
+    header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    if header is not None and header != settings.webhook_token:
+        raise HTTPException(status_code=403, detail="bad secret token header")
     data = await request.json()
     update = Update.de_json(data, request.app.state.application.bot)
     await request.app.state.application.process_update(update)
@@ -116,6 +124,9 @@ def health() -> dict:
         "base_url": settings.public_base_url,
         "log_url": f"{settings.public_base_url}/run.jsonl",
         "model": settings.model,
+        # The path Telegram must POST to. If getWebhookInfo shows a different
+        # one, the registration is stale -- redeploy to re-register.
+        "webhook_path": f"/telegram/{settings.webhook_token}",
     }
 
 
