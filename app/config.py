@@ -20,6 +20,14 @@ load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 def _env(name: str, default: str | None = None, required: bool = False) -> str:
     value = os.getenv(name, default)
+    # ALWAYS strip. A trailing newline pasted into a hosting dashboard is
+    # invisible there but fatal here: an HTTP header cannot contain a newline,
+    # so requests raises ValueError and the OpenAI SDK reports it as
+    # "APIConnectionError: Connection error" -- which reads like a network
+    # outage and sends you hunting in entirely the wrong place. Cost an hour.
+    # No config value in this app legitimately has surrounding whitespace.
+    if isinstance(value, str):
+        value = value.strip()
     if required and not value:
         raise RuntimeError(
             f"Missing required environment variable: {name}. "
@@ -31,7 +39,7 @@ def _env(name: str, default: str | None = None, required: bool = False) -> str:
 
 def _int_env(name: str, default: int) -> int:
     try:
-        return int(os.getenv(name, str(default)))
+        return int((os.getenv(name) or str(default)).strip())
     except ValueError:
         return default
 
