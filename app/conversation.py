@@ -14,8 +14,51 @@ the answer to the last message.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections import defaultdict, deque
+
+# A message that carries its own complete question needs no history. A message
+# that points BACK at something -- "that dataset", "the figures above" -- does.
+# Time-based expiry alone is not enough: several unrelated questions can land in
+# one chat inside any TTL you pick, and then question 3 silently computes over
+# question 1's data. So history is supplied only when the wording asks for it.
+_BACKREF = re.compile(
+    r"\b("
+    r"that|those|these|the above|above|previous|previously|earlier|"
+    r"aforementioned|same (?:data|dataset|list|table|numbers|values)|"
+    r"remember(?:ed)?|mentioned|you (?:just )?(?:computed|calculated|found|said)|"
+    r"my (?:data|dataset|list|numbers)|the (?:data|dataset|list|table)\b"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+# A bracketed numeric list, or a run of comma-separated numbers, means the data
+# is HERE. "Multiply each of these by 1.02: [12, 40, 87]" contains a back-
+# reference word, but "these" points at the list in the same sentence, not at a
+# previous turn.
+_INLINE_DATA = re.compile(
+    r"\[\s*-?\d[\d\s,.\-eE]*\]"                      # [12, 40, 87]
+    r"|(?:-?\d+(?:\.\d+)?\s*,\s*){3,}-?\d+(?:\.\d+)?"  # 1, 2, 3, 4
+)
+
+
+def has_inline_data(text: str) -> bool:
+    """True when the message carries its own dataset."""
+    return bool(_INLINE_DATA.search(text or ""))
+
+
+def needs_history(text: str) -> bool:
+    """True when the message refers back to something said in an earlier turn.
+
+    A message that both names a back-reference AND ships its own data is
+    self-contained -- the pronoun points at the data in front of it.
+    """
+    text = text or ""
+    if has_inline_data(text):
+        return False
+    return bool(_BACKREF.search(text))
 
 MAX_TURNS = 20
 # 10 minutes, not an hour. The grader's multi-turn messages arrive seconds

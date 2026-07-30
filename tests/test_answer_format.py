@@ -149,3 +149,29 @@ def test_list_placeholder_still_works():
     t = extract_response_template('Reply with ONLY {"values": [<numbers>]}')
     answer = coerce_answer({"values": [1.5, 2.5]}, t)
     assert json.loads(build_reply(answer, "https://h/run.jsonl", t)) == {"values": [1.5, 2.5]}
+
+
+# --- history gating -------------------------------------------------------
+# collect.py sends several questions into one chat within minutes. Without
+# gating, question 4 sees question 1's "remember this dataset" and computes over
+# the wrong numbers -- which is what produced a sum of 1740 in live testing.
+from app.conversation import needs_history  # noqa: E402
+
+
+def test_followup_gets_history():
+    assert needs_history('What is the sum of that dataset? Reply with ONLY {"total": <number>}')
+    assert needs_history("Sum the numbers you just computed.")
+    assert needs_history("Using the data above, find the maximum.")
+
+
+def test_self_contained_question_gets_no_history():
+    assert not needs_history("What is the median of [4, 8, 15, 16, 23, 42]?")
+    assert not needs_history("What percentage is 250 of 800? Round to 2 decimals.")
+    assert not needs_history("Which Indian state had the largest population in the 2011 Census?")
+
+
+def test_backref_word_plus_inline_data_is_self_contained():
+    # "these" points at the list in the same sentence, not a previous turn
+    assert not needs_history("Multiply each of these by 1.02: [12, 40, 87].")
+    assert not needs_history("I have this dataset: [14, 22, 39, 41, 58, 60]. Remember it.")
+    assert not needs_history("Sum those: 1, 2, 3, 4, 5")

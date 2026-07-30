@@ -18,6 +18,7 @@ from openai import OpenAI
 
 from .answer_format import answer_schema_hint, coerce_answer, wants_wrapper
 from .config import Settings
+from .conversation import needs_history
 from .run_logger import RunLogger
 from .tools import TOOL_SPECS, dispatch, parse_tool_args
 
@@ -357,6 +358,13 @@ class DataAnalystAgent:
     def _build_messages(self, conversation: list[dict], template: dict | None) -> list[dict]:
         history_note = ""
         prior = conversation[:-1]
+        current_text = conversation[-1]["text"] if conversation else ""
+        # Supply history only when this message actually points back at
+        # something. A self-contained question carries its own data and its own
+        # template; handing it the previous question's dataset is how an answer
+        # gets computed over the wrong numbers.
+        if prior and not needs_history(current_text):
+            prior = []
         if prior:
             lines = []
             for turn in prior[-self.s.max_history_turns:]:
