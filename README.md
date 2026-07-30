@@ -15,16 +15,22 @@ Telegram user (grader account, via Telethon)
         │  plain-text question
         ▼
 POST /telegram/<secret>        FastAPI + python-telegram-bot (webhook)
+        │  ack 200 immediately, process in a background task,
+        │  drop duplicate update_ids  (Telegram retries slow webhooks)
         │
-        ├─ conversation.py     per-chat turn history; one lock per chat
+        ├─ conversation.py     per-chat turn history; one lock per chat;
+        │                      history supplied only on a back-reference
         ├─ answer_format.py    extract the JSON template the message asked for
         │
         ▼
     agent.py  ── tool-use loop (OpenAI-compatible, AIPipe by default)
-        │        ├─ run_python  → sandbox.py (subprocess, rlimits, timeout)
-        │        ├─ fetch_url   → requests
-        │        └─ final_answer
-        │        deadline guard → forced answer → key-correct skeleton
+        │        ├─ web_search   → Tavily → Brave → DuckDuckGo → Mojeek
+        │        ├─ fetch_url    → requests (SSL-chain fallback)
+        │        ├─ read_pdf     → pdfplumber, whole document in one call
+        │        ├─ run_python   → sandbox.py (subprocess, rlimits, timeout)
+        │        └─ final_answer → requires a declared source
+        │        retries → model fallback → deadline guard → forced answer
+        │        → key-correct skeleton   (never silent, never prose)
         ▼
     run_logger.py  append JSONL ─────────► logs/run.jsonl  &  logs/runs/<id>.jsonl
         │                                        │

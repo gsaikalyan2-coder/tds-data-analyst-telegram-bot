@@ -53,8 +53,8 @@ one message. So a single turn must finish fast:
 
 | knob | default | why |
 |---|---|---|
-| `TURN_DEADLINE_SECONDS` | 150 | hard wall-clock for one agent run |
-| `MAX_TOOL_CALLS` | 12 | loop bound |
+| `TURN_DEADLINE_SECONDS` | 150 (120 on Render) | hard wall-clock for one agent run |
+| `MAX_TOOL_CALLS` | 18 | loop bound |
 | `SANDBOX_TIMEOUT_SECONDS` | 45 | one `run_python` call |
 
 At 20s remaining the agent stops analysing and forces a shaped best-effort
@@ -66,6 +66,7 @@ answer (`_force_answer`). At absolute worst it emits a key-correct skeleton
 | file | responsibility | change with care |
 |---|---|---|
 | `app/answer_format.py` | template extraction + reply shaping | **highest risk file** — every change needs tests |
+| `app/config.py` | env loading; **strips every value** | a trailing newline in a key breaks the auth header |
 | `app/agent.py` | LLM tool-use loop, deadline, fallbacks | |
 | `app/tools.py` | tool specs + dispatch | |
 | `app/sandbox.py` | subprocess Python execution | |
@@ -85,7 +86,13 @@ answer (`_force_answer`). At absolute worst it emits a key-correct skeleton
 ## Things that will bite you
 
 - Render's **free** plan sleeps after 15 min idle. Cold start can eat 50s+ of
-  the grading budget. Use `starter`, or keep a 10-minute cron ping on `/health`.
+  the grading budget. This deploys on `free` with a 10-minute cron ping on
+  `/health` (cron-job.org) to stop it sleeping. `starter` removes the need.
+- **`/health` does not test the LLM** — it only echoes configuration and stays
+  green with a dead key. Use `GET /debug/llm`, which makes a real call and
+  reports the raw status, TLS reachability and whether the key has stray
+  whitespace. A trailing newline in `LLM_API_KEY` surfaces as
+  `APIConnectionError`, which reads like a network outage and is not one.
 - Render's filesystem is ephemeral without a disk — the `disk:` block in
   `render.yaml` is what makes `run.jsonl` survive restarts.
 - Bots cannot message bots. The grader logs in as a **user account** via
