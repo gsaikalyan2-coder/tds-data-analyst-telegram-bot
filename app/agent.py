@@ -171,6 +171,10 @@ def _contains_status_string(answer: Any) -> bool:
 
 
 class DataAnalystAgent:
+    # Transient LLM failures (429, 502, connection resets) are common on shared
+    # proxies. Retry a bounded number of times before switching models.
+    MAX_TRANSIENT_RETRIES = 2
+
     def __init__(self, settings: Settings):
         self.s = settings
         self.client = OpenAI(
@@ -192,7 +196,10 @@ class DataAnalystAgent:
         The LAST user message is the one being answered."""
         deadline = time.time() + self.s.turn_deadline_seconds
         messages = self._build_messages(conversation, template)
-        logger.event("agent_start", model=self.s.model,
+        # Per-run model state. Never mutate self.s -- it is shared across every
+        # request in the process.
+        state = {"model": self.s.model, "retries": 0, "swapped": False}
+        logger.event("agent_start", model=state["model"],
                      template=template, deadline_s=self.s.turn_deadline_seconds)
 
         answer: Any = None
@@ -200,12 +207,12 @@ class DataAnalystAgent:
             remaining = deadline - time.time()
             if remaining <= 20:
                 logger.event("deadline_pressure", remaining_s=round(remaining, 1))
-                answer = self._force_answer(messages, template, logger)
+                answer = self._force_answer(messages, template, logger, state)
                 break
 
             try:
                 resp = self.client.chat.completions.create(
-                    model=self.s.model,
+                    model=state["model"],
                     messages=messages,
                     tools=TOOL_SPECS,
                     tool_choice="auto",
@@ -213,7 +220,7 @@ class DataAnalystAgent:
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.error("llm_call", f"{type(exc).__name__}: {exc}")
-                if not self._swap_to_fallback(logger):
+                if not self._swap_to_fallback(state, logger):
                     break
                 continue
 
@@ -339,7 +346,7 @@ class DataAnalystAgent:
 
         if answer is None:
             logger.event("no_answer_after_loop")
-            answer = self._force_answer(messages, template, logger)
+            answer = self._force_answer(messages, template, logger, state)
         if answer is None:
             answer = self._skeleton(template)
             logger.event("answer_skeleton_fallback", answer=answer)
@@ -384,12 +391,38 @@ class DataAnalystAgent:
             {"role": "user", "content": user_block},
         ]
 
-    def _swap_to_fallback(self, logger: RunLogger) -> bool:
-        if self.s.model == self.s.fallback_model:
-            return False
-        logger.event("model_fallback", to=self.s.fallback_model)
-        object.__setattr__(self.s, "model", self.s.fallback_model)
-        return True
+    def _swap_to_fallback(self, state: dict, logger: RunLogger) -> bool:
+        """Decide how to recover from an LLM API error, for THIS run only.
+
+        Two bugs were here. (1) `model == fallback_model` by default, so this
+        returned False immediately and a single transient 429 ended the whole
+        tool loop. (2) It mutated the frozen, process-wide Settings via
+        object.__setattr__, so one bad request permanently downgraded the model
+        for every later request in the process -- and nothing ever restored it.
+
+        Now: retry the same model a bounded number of times, then switch models
+        if a distinct fallback is configured, and keep all of that in per-run
+        state so concurrent runs cannot affect each other.
+        """
+        if state["retries"] < self.MAX_TRANSIENT_RETRIES:
+            state["retries"] += 1
+            wait = min(2 ** state["retries"], 8)
+            logger.event("llm_retry", attempt=state["retries"], sleep_s=wait,
+                         model=state["model"])
+            time.sleep(wait)
+            return True
+
+        if not state["swapped"] and self.s.fallback_model != state["model"]:
+            state["swapped"] = True
+            state["retries"] = 0
+            logger.event("model_fallback", frm=state["model"],
+                         to=self.s.fallback_model)
+            state["model"] = self.s.fallback_model
+            return True
+
+        logger.event("llm_giving_up", model=state["model"],
+                     retries=state["retries"], swapped=state["swapped"])
+        return False
 
     # The model occasionally invents a plausible parameter name instead of the
     # declared one -- "answer", "result", "value". Missing it costs a whole
@@ -428,8 +461,9 @@ class DataAnalystAgent:
             return None
 
     def _force_answer(self, messages: list[dict], template: dict | None,
-                      logger: RunLogger) -> Any:
+                      logger: RunLogger, state: dict | None = None) -> Any:
         """Last chance: one non-tool call asking for the JSON answer only."""
+        model = (state or {}).get("model") or self.s.model
         prompt = (
             "STOP analysing. Time is up. Reply with ONLY the answer JSON object "
             "in exactly this shape, and nothing else:\n"
@@ -438,7 +472,7 @@ class DataAnalystAgent:
         )
         try:
             resp = self.client.chat.completions.create(
-                model=self.s.model,
+                model=model,
                 messages=messages + [{"role": "user", "content": prompt}],
                 temperature=0,
                 response_format={"type": "json_object"},

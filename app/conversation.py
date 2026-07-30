@@ -18,7 +18,12 @@ import time
 from collections import defaultdict, deque
 
 MAX_TURNS = 20
-TTL_SECONDS = 3600
+# 10 minutes, not an hour. The grader's multi-turn messages arrive seconds
+# apart, so they still share context. But separate QUESTIONS also land in the
+# same chat, minutes or hours apart -- with a one-hour window, question 1's
+# "remember this dataset" is still in scope when question 3 says "that
+# dataset", and the answer is silently computed over the wrong data.
+TTL_SECONDS = 600
 
 
 class ConversationStore:

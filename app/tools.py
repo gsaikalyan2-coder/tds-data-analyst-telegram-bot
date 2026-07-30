@@ -43,6 +43,7 @@ _MIN_SEARCH_INTERVAL = 1.5  # seconds; only applied to keyless backends
 # Agents re-issue near-identical queries when a fetch disappoints them. Serving
 # a repeat from cache costs nothing and avoids burning the rate limit.
 _SEARCH_CACHE: dict[str, tuple[float, dict]] = {}
+_SEARCH_CACHE_MAX = 64
 _CACHE_TTL = 600.0
 _NEGATIVE_CACHE_TTL = 45.0
 
@@ -429,6 +430,7 @@ def web_search(query: str, max_results: int = MAX_SEARCH_RESULTS) -> dict:
             payload = {"ok": True, "provider": provider, "query": query,
                        "count": len(results), "results": results}
             _SEARCH_CACHE[cache_key] = (time.time(), payload)
+            _evict(_SEARCH_CACHE, _SEARCH_CACHE_MAX)
             return payload
 
     failure = {
@@ -447,11 +449,24 @@ def web_search(query: str, max_results: int = MAX_SEARCH_RESULTS) -> dict:
         ),
     }
     _SEARCH_CACHE[cache_key] = (time.time(), failure)
+    _evict(_SEARCH_CACHE, _SEARCH_CACHE_MAX)
     return failure
 
 
-MAX_PDF_BYTES = 40 * 1024 * 1024
+# 25 MB, not 40. On a 512 MB instance a single 40 MB PDF plus pdfplumber's
+# parse tree plus the pandas import is already most of the budget.
+MAX_PDF_BYTES = 25 * 1024 * 1024
+# Bounded: two entries. Unbounded, three cached PDFs retain ~120 MB for the
+# life of the process and the instance is OOM-killed mid-answer.
+_PDF_CACHE_MAX = 2
 _PDF_CACHE: dict[str, tuple[float, bytes]] = {}
+
+
+def _evict(cache: dict, limit: int) -> None:
+    """Drop the oldest entries until the cache is within `limit`."""
+    while len(cache) > limit:
+        oldest = min(cache, key=lambda k: cache[k][0])
+        cache.pop(oldest, None)
 
 
 def _get_with_ssl_fallback(url: str, **kwargs):
@@ -495,6 +510,7 @@ def _pdf_bytes(url: str) -> bytes:
     if len(data) > MAX_PDF_BYTES:
         raise ValueError(f"PDF larger than {MAX_PDF_BYTES // 1024 // 1024} MB; refuse to load")
     _PDF_CACHE[url] = (time.time(), data)
+    _evict(_PDF_CACHE, _PDF_CACHE_MAX)
     return data
 
 
