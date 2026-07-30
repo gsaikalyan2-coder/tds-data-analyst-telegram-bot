@@ -180,6 +180,74 @@ def health() -> dict:
     }
 
 
+@app.get("/debug/llm")
+def debug_llm() -> dict:
+    """Run one LLM request from INSIDE the container and report the raw result.
+
+    /health only reports configuration -- it never touches the LLM, so it stays
+    green with a dead key or an unreachable endpoint. This actually calls out,
+    and returns the exact exception type and message plus a plain-socket
+    reachability probe, so a connection failure can be told apart from an auth
+    failure, a bad model, or a quota problem.
+
+    Diagnostic only. Safe to leave: it exposes no secrets, only lengths and
+    prefixes.
+    """
+    import socket
+    import ssl
+    from urllib.parse import urlparse
+
+    out: dict = {
+        "base_url": settings.llm_base_url,
+        "model": settings.model,
+        "api_key_len": len(settings.llm_api_key),
+        "api_key_prefix": settings.llm_api_key[:6],
+        "api_key_has_whitespace": settings.llm_api_key != settings.llm_api_key.strip(),
+    }
+
+    # 1. Can we open a TLS socket to the host at all?
+    host = urlparse(settings.llm_base_url).hostname or ""
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((host, 443), timeout=15) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                out["tcp_tls"] = f"ok (TLS {ssock.version()})"
+    except Exception as exc:  # noqa: BLE001
+        out["tcp_tls"] = f"FAILED {type(exc).__name__}: {exc}"
+
+    # 2. Raw HTTP POST, bypassing the OpenAI SDK entirely.
+    try:
+        import requests as _rq
+        r = _rq.post(
+            f"{settings.llm_base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {settings.llm_api_key}",
+                     "Content-Type": "application/json"},
+            json={"model": settings.model,
+                  "messages": [{"role": "user", "content": "say pong"}],
+                  "max_tokens": 5},
+            timeout=30,
+        )
+        out["raw_http_status"] = r.status_code
+        out["raw_http_body"] = (r.text or "")[:600]
+    except Exception as exc:  # noqa: BLE001
+        out["raw_http_status"] = None
+        out["raw_http_body"] = f"{type(exc).__name__}: {exc}"
+
+    # 3. The same call through the SDK the agent actually uses.
+    try:
+        agent = app.state.application.bot_data["agent"]
+        resp = agent.client.chat.completions.create(
+            model=settings.model,
+            messages=[{"role": "user", "content": "say pong"}],
+            max_tokens=5,
+        )
+        out["sdk"] = f"ok: {resp.choices[0].message.content!r}"
+    except Exception as exc:  # noqa: BLE001
+        out["sdk"] = f"{type(exc).__name__}: {exc}"
+
+    return out
+
+
 @app.get("/")
 def root() -> dict:
     return {"service": "tds-p1-data-analyst-telegram-bot",
