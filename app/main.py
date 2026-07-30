@@ -10,9 +10,12 @@ Run:  uvicorn app.main:app --host 0.0.0.0 --port $PORT
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import os
+import time
+from collections import OrderedDict
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -60,6 +63,13 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        # Updates are now processed in background tasks, so a shutdown mid-run
+        # would drop a reply the grader is waiting on. Give them a bounded
+        # chance to finish -- silence scores zero, a late reply may not.
+        if _BACKGROUND_TASKS:
+            log.info("draining %d in-flight update(s)", len(_BACKGROUND_TASKS))
+            with contextlib.suppress(Exception):
+                await asyncio.wait(set(_BACKGROUND_TASKS), timeout=30)
         with contextlib.suppress(Exception):
             if application.updater and application.updater.running:
                 await application.updater.stop()
@@ -72,6 +82,34 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="TDS P1 Data-Analyst Telegram Bot", lifespan=lifespan)
 
 
+# --- duplicate-delivery protection ----------------------------------------
+# Telegram re-delivers an update if the webhook does not return 200 quickly
+# (its patience is on the order of a minute). An agent run can take longer than
+# that, so a slow question was being delivered TWICE and answered TWICE.
+#
+# collect.py takes the FIRST message the bot sends back after each send, so on a
+# multi-turn question a stray duplicate of reply 1 gets read as the answer to
+# message 2 -- silently scoring the wrong thing.
+#
+# Two independent defences:
+#   1. ACK IMMEDIATELY, process in the background -> Telegram never retries.
+#   2. Deduplicate on update_id -> even a retry that slips through is dropped.
+_SEEN_UPDATES: OrderedDict[int, float] = OrderedDict()
+_SEEN_MAX = 1000
+_BACKGROUND_TASKS: set = set()
+
+
+def _already_seen(update_id: int | None) -> bool:
+    if update_id is None:
+        return False
+    if update_id in _SEEN_UPDATES:
+        return True
+    _SEEN_UPDATES[update_id] = time.time()
+    while len(_SEEN_UPDATES) > _SEEN_MAX:
+        _SEEN_UPDATES.popitem(last=False)
+    return False
+
+
 @app.post("/telegram/{secret}")
 async def telegram_webhook(secret: str, request: Request) -> Response:
     # Accept the derived token, and the raw secret too, so an already-registered
@@ -81,9 +119,21 @@ async def telegram_webhook(secret: str, request: Request) -> Response:
     header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
     if header is not None and header != settings.webhook_token:
         raise HTTPException(status_code=403, detail="bad secret token header")
+
     data = await request.json()
     update = Update.de_json(data, request.app.state.application.bot)
-    await request.app.state.application.process_update(update)
+
+    if _already_seen(getattr(update, "update_id", None)):
+        log.warning("duplicate update_id %s dropped", update.update_id)
+        return Response(status_code=200)
+
+    # Fire and forget. Returning 200 now is what stops the retry that caused
+    # the double reply. Keep a strong reference so the task is not garbage
+    # collected mid-run.
+    task = asyncio.create_task(request.app.state.application.process_update(update))
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
     return Response(status_code=200)
 
 
