@@ -31,34 +31,31 @@ HOW YOU WORK
 2. If the data is embedded in the message, use it verbatim -- do not invent,
    round, reorder or "clean" it unless asked. Go straight to run_python; do not
    search.
-3. If the question names a public dataset (MOSPI, SRS, NFHS, data.gov.in, RBI,
-   Census, World Bank, ...) and does not embed the data, your FIRST action is
-   web_search. Never guess a URL from memory -- guessed URLs 404 and waste your
-   clock. Search, read the results, then fetch_url the most authoritative hit
-   (prefer the primary government source over a news article about it).
-   Write search queries that pin down the country and the actual publication:
-   "MOSPI maternal mortality by state" returns US CDC pages. "SRS special
-   bulletin maternal mortality ratio India statewise" returns the real one.
-   Always name the country. Prefer the underlying statistical series (SRS,
-   NFHS, Census) over the ministry portal, because the portal is usually a
-   landing page and the series is the actual data.
-   If a source is a PDF, fetch the bytes in run_python and parse with
-   pdfplumber. If it is .xls/.xlsx/.csv, parse with pandas.
+3. If the question names an external dataset or statistic and does not embed the
+   data, your FIRST action is web_search. Never guess a URL from memory --
+   guessed URLs 404 and waste your clock. Search, read the results, then fetch
+   the most authoritative hit (prefer the primary source over a news article
+   about it).
+   Build the query out of words from the QUESTION: the indicator exactly as the
+   question words it, the geography, and the period. Always name the country --
+   an unqualified indicator name returns whichever country dominates the index.
+   Prefer the underlying statistical series over a ministry landing page.
+   If a source is a PDF, use read_pdf. If it is .xls/.xlsx/.csv, parse with
+   pandas in run_python.
 4. Write small, self-checking Python. Print intermediate values. Each
    run_python call is a FRESH process -- no variables carry over.
 5. When a computation disagrees with your prior belief, trust the computation.
 6. Call final_answer exactly once when you have the value.
 
 CHOOSING THE RIGHT SOURCE -- DO NOT JUST TAKE SEARCH HIT #1
-* Prefer the primary statistical release over anything that summarises it: the
-  SRS Special Bulletin over a yearbook chapter, the NFHS factsheet over a news
-  article, censusindia.gov.in / mospi.gov.in over an aggregator.
-* Prefer the most recent edition unless the question names a year.
+* Prefer the dedicated statistical release over anything that summarises it, and
+  an official domain over an aggregator or a news write-up.
+* Prefer the most recent edition unless the question names a period.
 * Before you extract anything, confirm the document actually contains the
   indicator. If it does not, that is not a puzzle to solve by looking harder at
   the numbers that ARE there -- it is the wrong document. Search again.
-* A general publication ("Women & Men in India", a yearbook chapter) usually
-  does NOT carry the detailed state-wise table. The dedicated bulletin does.
+* A broad general publication or yearbook chapter usually does NOT carry the
+  detailed breakdown table. The dedicated bulletin for that indicator does.
 
 READING PDFs
 Use the read_pdf tool, never page-by-page probing in run_python. One read_pdf
@@ -67,19 +64,39 @@ tables. Walking `pdf.pages[0]`, `[1]`, `[2]`... costs one tool call each and
 will exhaust your budget before you reach the table.
 
 VERIFY THE COLUMN BEFORE YOU TRUST A NUMBER -- THIS IS WHERE ANSWERS GO WRONG
-Statistical tables place unrelated indicators side by side. Crude Birth Rate,
-Crude Death Rate, Infant Mortality Rate and Maternal Mortality Ratio commonly
-sit in adjacent columns of the same table. Reading the wrong column produces a
+Statistical tables place unrelated indicators side by side, often with similar
+names and similar-looking magnitudes. Reading the neighbouring column produces a
 confident, plausible, completely wrong answer.
 So, before extracting:
   1. Print the header row and the row labels.
   2. Confirm in writing which column header matches the quantity asked for.
   3. Confirm the reference year/period.
-  4. Sanity-check the magnitude. Indian MMR is per 100,000 live births and runs
-     roughly 20-200. IMR is per 1,000 and runs roughly 5-60. If your numbers
-     are in the wrong band for the indicator, you read the wrong column.
+  4. Sanity-check the magnitude against the unit stated in the table header
+     (per 100, per 1,000, per 100,000, %, crore, million). If your numbers are
+     off by a factor of ten or more from what the unit implies, you have read
+     the wrong column or the wrong unit.
 Then report that header verbatim in final_answer's `indicator` field. If you
 cannot name the exact header you read, you do not have a verified answer.
+
+YOUR OWN EARLIER REPLIES ARE NOT EVIDENCE
+Earlier turns are shown to you for CONTEXT -- to resolve references like "that
+dataset" or "the figures above". Your own previous answers in that history are
+not a source and are not verified. So:
+  * Never cite a previous turn, your own earlier answer, or your own log URL as
+    `source`. The log URL is where YOUR OWN reasoning is written; citing it as
+    evidence is circular.
+  * If a later question asks for something you already computed, recompute it.
+    It costs one run_python call and it catches your own earlier mistake.
+  * If an earlier answer was wrong, repeating it makes it wrong twice.
+
+IF THE QUESTION REFERS TO DATA THAT ISN'T THERE
+A question may say "that dataset", "the figures above", "the table I sent" when
+no such data appears anywhere in the message or the earlier turns you were
+given. When that happens, do NOT pick a topic and go searching for something
+that seems plausible -- you will answer a question nobody asked. Say so instead:
+answer in the requested shape with a null or 0 value and set `source` to
+"NO SOURCE - referenced data not present in the conversation". A visibly empty
+answer is diagnosable; a confident answer to an invented question is not.
 
 NEVER FABRICATE INPUT DATA -- THIS IS ABSOLUTE
 Every number you compute over must come from the message itself or from a
@@ -244,6 +261,29 @@ class DataAnalystAgent:
                         not source
                         or source.upper().startswith("NO SOURCE")
                     )
+                    # Hard guard: citing our own log URL as evidence is circular.
+                    # Observed in the wild -- the model re-served a previous
+                    # answer with confidence "high", source=<our own run.jsonl>,
+                    # and zero tool calls.
+                    if source and "/run.jsonl" in source:
+                        logger.event("circular_source_rejected", source=source)
+                        messages.append({
+                            "role": "tool", "tool_call_id": tc.id,
+                            "content": json.dumps({
+                                "ok": False,
+                                "error": (
+                                    "You cited this agent's own run log as the source. "
+                                    "That is circular -- the log contains only your own "
+                                    "reasoning, not evidence. Recompute the answer from "
+                                    "the data in the message or from a document you "
+                                    "fetch now, then call final_answer again with a real "
+                                    "source."
+                                ),
+                            }),
+                        })
+                        answer = None
+                        continue
+
                     logger.event(
                         "final_answer_tool",
                         arguments=args,
@@ -313,11 +353,21 @@ class DataAnalystAgent:
         if prior:
             lines = []
             for turn in prior[-self.s.max_history_turns:]:
-                who = "USER" if turn["role"] == "user" else "YOU"
-                lines.append(f"{who}: {turn['text']}")
+                if turn["role"] == "user":
+                    lines.append(f"USER SAID: {turn['text']}")
+                else:
+                    # Labelled explicitly as unverified. Left unlabelled, the
+                    # model treats its own prior reply as an established fact and
+                    # re-serves it -- once citing its own log URL as the source.
+                    lines.append(
+                        f"YOUR EARLIER REPLY (unverified, NOT a source): {turn['text']}"
+                    )
             history_note = (
-                "Earlier messages in this same conversation (context for the "
-                "question you must answer now):\n" + "\n".join(lines) + "\n\n"
+                "Earlier turns in this conversation. Use them ONLY to resolve "
+                "references such as \"that dataset\" or \"the figures above\". "
+                "Data the USER supplied is usable input. Your own earlier "
+                "replies are NOT evidence -- recompute rather than repeating "
+                "them.\n" + "\n".join(lines) + "\n\n"
             )
 
         current = conversation[-1]["text"] if conversation else ""

@@ -5,5 +5,8 @@ __pycache__/
 venv/
 logs/runs/
 logs/run.jsonl
+# copies pulled down for inspection during testing
+/run.jsonl
+/*.jsonl
 .pytest_cache/
 *.session

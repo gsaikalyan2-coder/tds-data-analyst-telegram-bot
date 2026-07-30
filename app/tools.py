@@ -72,8 +72,7 @@ TOOL_SPECS: list[dict] = [
             "description": (
                 "Search the web for pages, datasets and official statistics. "
                 "Use this FIRST whenever the question names a dataset or a "
-                "statistic you do not already have in hand (MOSPI, SRS, NFHS, "
-                "data.gov.in, RBI, Census, World Bank, ...). Never guess a URL "
+                "statistic you do not already have in hand. Never guess a URL "
                 "-- search for it, then fetch_url the result you want. Returns "
                 "a list of {title, url, snippet}."
             ),
@@ -83,9 +82,10 @@ TOOL_SPECS: list[dict] = [
                     "query": {
                         "type": "string",
                         "description": (
-                            "A specific search query. Include the source name and the "
-                            "year/edition if known, e.g. "
-                            "'SRS special bulletin maternal mortality ratio statewise'."
+                            "A specific search query built from words in the QUESTION: "
+                            "the indicator as the question words it, the geography, "
+                            "the period, and the publication name if known. Always "
+                            "name the country."
                         ),
                     },
                     "max_results": {"type": "integer", "description": "Default 8."},
@@ -160,9 +160,9 @@ TOOL_SPECS: list[dict] = [
                     "find": {
                         "type": "string",
                         "description": (
-                            "The exact indicator name to look for, e.g. "
-                            "'Maternal Mortality Ratio'. Use the full official "
-                            "name, not an acronym -- documents spell it out."
+                            "The exact indicator name to look for, taken from the "
+                            "question. Use the full official wording, not an "
+                            "acronym -- documents spell indicator names out."
                         ),
                     },
                     "max_pages": {
@@ -213,8 +213,8 @@ TOOL_SPECS: list[dict] = [
                         "description": (
                             "REQUIRED when the answer came from a document. The exact "
                             "column/row header you read the numbers from, copied "
-                            "verbatim from the table -- e.g. 'Maternal Mortality Ratio "
-                            "(MMR)'. If the header you actually read does not name the "
+                            "verbatim from the table, including any unit shown. "
+                            "If the header you actually read does not name the "
                             "quantity the question asked for, you have the wrong column: "
                             "go back and find the right one instead of submitting. "
                             "Use 'inline' for data embedded in the message."
@@ -439,9 +439,9 @@ def web_search(query: str, max_results: int = MAX_SEARCH_RESULTS) -> dict:
         "error": (
             "All search providers failed or returned nothing. Try ONE shorter, "
             "differently-worded query (drop acronyms, use plain words). If that "
-            "also fails, try fetch_url directly on an official domain you are "
-            "confident exists, e.g. https://censusindia.gov.in or "
-            "https://www.mospi.gov.in . Do NOT invent data -- if you truly "
+            "also fails, try fetch_url directly on the official statistical "
+            "agency domain for the country in the question. Do NOT invent "
+            "data -- if you truly "
             "cannot retrieve a source, answer from general knowledge and set "
             "source to 'NO SOURCE - could not retrieve data'."
         ),
@@ -454,6 +454,32 @@ MAX_PDF_BYTES = 40 * 1024 * 1024
 _PDF_CACHE: dict[str, tuple[float, bytes]] = {}
 
 
+def _get_with_ssl_fallback(url: str, **kwargs):
+    """GET, retrying once without certificate verification on a cert error.
+
+    Several Indian government statistics hosts (censusindia.gov.in among them)
+    serve an incomplete certificate chain, so requests raises
+    SSLCertVerificationError: unable to get local issuer certificate. That
+    killed two tool calls on the primary source in a live run.
+
+    We are downloading public statistics, not sending credentials, so falling
+    back to an unverified fetch trades a MITM risk we do not care about for
+    access to the authoritative document. The fallback is logged in the result
+    so it is visible in the run log rather than silent.
+    """
+    try:
+        return requests.get(url, **kwargs), False
+    except requests.exceptions.SSLError:
+        insecure = dict(kwargs)
+        insecure["verify"] = False
+        try:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        except Exception:  # noqa: BLE001
+            pass
+        return requests.get(url, **insecure), True
+
+
 def _pdf_bytes(url: str) -> bytes:
     """Download once, reuse across calls in the same run. Government PDFs are
     often 5-20 MB and re-downloading them per page walk is what makes PDF
@@ -461,8 +487,9 @@ def _pdf_bytes(url: str) -> bytes:
     hit = _PDF_CACHE.get(url)
     if hit and time.time() - hit[0] < _CACHE_TTL:
         return hit[1]
-    resp = requests.get(url, timeout=60, headers={"User-Agent": USER_AGENT},
-                        allow_redirects=True, stream=True)
+    resp, _insecure = _get_with_ssl_fallback(
+        url, timeout=60, headers={"User-Agent": USER_AGENT},
+        allow_redirects=True, stream=True)
     resp.raise_for_status()
     data = resp.raw.read(MAX_PDF_BYTES + 1, decode_content=True) or resp.content
     if len(data) > MAX_PDF_BYTES:
@@ -574,13 +601,16 @@ _BINARY_HINTS = (
 
 def fetch_url(url: str, max_chars: int = MAX_FETCH_CHARS) -> dict:
     try:
-        resp = requests.get(
+        resp, insecure = _get_with_ssl_fallback(
             url,
             timeout=30,
             headers={"User-Agent": USER_AGENT, "Accept": "*/*"},
             allow_redirects=True,
         )
         ctype = resp.headers.get("Content-Type", "")
+        # Recorded in the payload so the run log shows when a certificate chain
+        # was not verified, rather than that being invisible.
+        ssl_note = {"tls_verified": not insecure} if insecure else {}
 
         # Never inline binary payloads. Decoding a .xls/.pdf as text produces
         # pages of mojibake that burn the context window and tell the model
@@ -602,6 +632,7 @@ def fetch_url(url: str, max_chars: int = MAX_FETCH_CHARS) -> dict:
                     "  df = pd.read_excel(io.BytesIO(r.content))   # or pd.read_csv / pdfplumber\n"
                     "  print(df.head(20)); print(df.columns.tolist())"
                 ),
+                **ssl_note,
             }
 
         text = resp.text or ""
@@ -612,6 +643,7 @@ def fetch_url(url: str, max_chars: int = MAX_FETCH_CHARS) -> dict:
             "length": len(text),
             "text": text[:max_chars],
             "truncated": len(text) > max_chars,
+            **ssl_note,
         }
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}

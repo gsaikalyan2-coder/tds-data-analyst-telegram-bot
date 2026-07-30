@@ -41,10 +41,10 @@ def _limits():  # pragma: no cover - executed in the child process
     resource.setrlimit(resource.RLIMIT_AS, (2 * 1024 ** 3, 2 * 1024 ** 3))
     resource.setrlimit(resource.RLIMIT_CPU, (120, 120))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    try:
-        resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
-    except (ValueError, OSError):
-        pass
+    # No RLIMIT_NPROC. It is counted per-UID, not per-process, so on a shared
+    # container it collides with whatever else runs as the same user and makes
+    # `import pandas` fail nondeterministically. RLIMIT_AS + RLIMIT_CPU + the
+    # subprocess timeout already bound this.
     os.setsid()
 
 
@@ -79,8 +79,16 @@ def _child_env(tmp: str) -> dict:
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONIOENCODING": "utf-8",
         "MPLBACKEND": "Agg",
-        "OPENBLAS_NUM_THREADS": "2",
-        "OMP_NUM_THREADS": "2",
+        # Single-threaded BLAS. On a small container, `import pandas` under a
+        # process-count rlimit dies with
+        #   OpenBLAS blas_thread_init: pthread_create failed ...
+        #   Resource temporarily unavailable
+        # which reads like a code error and costs the agent a tool call.
+        "OPENBLAS_NUM_THREADS": "1",
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+        "VECLIB_MAXIMUM_THREADS": "1",
     }
     for name in _PASSTHROUGH_VARS:
         value = os.environ.get(name)
